@@ -13,6 +13,7 @@ import math
 from scene import Scene
 from gaussian_renderer import render
 from utils.general_utils import safe_state
+from utils.inpainting_utils import InpaintingConfig, RealTimeGaussianInpainter
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 
@@ -199,6 +200,14 @@ def main(args, dataset_args, pipeline_args):
     
     # 4a. Decode Features
     index = faiss.read_index(args.pq_index)
+    inpainter = RealTimeGaussianInpainter(
+        gaussians=gaussians,
+        pq_index=index,
+        config=InpaintingConfig(
+            max_semantic_clusters=args.inpaint_k,
+            blend_knn_k=args.inpaint_blend_k,
+        ),
+    )
     feat_idx = gaussians._language_feature.clone()
     valid_mask = (torch.sum(feat_idx, 1) != 255 * (index.coarse_code_size() + index.code_size))
     decoded_cpu = np.zeros((feat_idx.shape[0], 512), dtype=np.float32)
@@ -251,6 +260,15 @@ def main(args, dataset_args, pipeline_args):
 
         elif action in ["delete", "remove", "drop"]:
             delete_selection(gaussians, mask)
+            # Real-time 3D semantic patch inpainting executes immediately after deletion.
+            stats = inpainter.inpaint(mask)
+            if stats.get("status", 0) == 1:
+                print(
+                    f"   -> Inpainted hole with {stats['cloned']} cloned gaussians "
+                    f"(boundary={stats['boundary']}, removed={stats['removed']})"
+                )
+            else:
+                print(f"   -> Inpainting skipped/fallback (reason={stats.get('reason', -1)})")
     else:
         print("   -> Warning: No objects selected. Rendering unchanged scene.")
 
@@ -275,6 +293,8 @@ if __name__ == "__main__":
     parser.add_argument("--edit_prompt", type=str, required=True, help="Command to execute")
     parser.add_argument("--pq_index", type=str, required=True, help="Path to FAISS index")
     parser.add_argument("--threshold", type=float, default=0.2, help="CLIP Sensitivity")
+    parser.add_argument("--inpaint_k", type=int, default=3, help="Semantic boundary clusters for inpainting")
+    parser.add_argument("--inpaint_blend_k", type=int, default=5, help="KNN neighbors for seam blending")
     
     # Standard Render Args
     parser.add_argument("--skip_train", action="store_true")
