@@ -104,12 +104,35 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
+        
+    # Generate depth map
+    import torch
+    
+    # Extract depth by feeding view-space Z coordinates into the rasterizer as "color"
+    # Project means3D to view space to extract Z coordinates (Depth)
+    z_depth = means3D @ viewpoint_camera.world_view_transform[:3, 2] + viewpoint_camera.world_view_transform[3, 2]
+    # Rasterizer expects 3-channel (RGB) attributes, so we repeat the 1D Z-depth
+    z_depth = z_depth.unsqueeze(1).repeat(1, 3)
+    
+    rendered_depth, _, _ = rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = None,
+        colors_precomp = z_depth,
+        language_feature_precomp = language_feature_precomp,
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp)
+    depth_image = rendered_depth[0:1, :, :]
+    
     # end_time = time.time()
     # print('render_init_rasterizer程序运行时间为: %s Seconds'%(end_time-start_time))
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     
     return {"render": rendered_image,
+            "depth": depth_image,
             "language_feature_image": language_feature_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,

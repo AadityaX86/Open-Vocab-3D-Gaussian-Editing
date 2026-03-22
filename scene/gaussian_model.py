@@ -145,6 +145,61 @@ class GaussianModel:
         self.spatial_lr_scale,
         self._semantic_features) = model_args
 
+    def freeze(self):
+        self._xyz.requires_grad_(False)
+        self._features_dc.requires_grad_(False)
+        self._features_rest.requires_grad_(False)
+        self._scaling.requires_grad_(False)
+        self._rotation.requires_grad_(False)
+        self._opacity.requires_grad_(False)
+        if self._language_feature is not None:
+            self._language_feature.requires_grad_(False)
+
+    def mark_frozen(self):
+        # A flag to track how many original Gaussians should be frozen
+        # when we perform gradient descents on newly added ones.
+        self.frozen_count = self._xyz.shape[0]
+
+    def inject_gaussians(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_language_feature=None):
+        """ Inject new explicit Gaussians into the scene and optimizer """
+        d = {"xyz": new_xyz,
+        "f_dc": new_features_dc,
+        "f_rest": new_features_rest,
+        "opacity": new_opacities,
+        "scaling" : new_scaling,
+        "rotation" : new_rotation}
+
+        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        if new_language_feature is not None and self._language_feature is not None:
+            # handle language feature concatenation separately if not within optimizer
+            self._language_feature = nn.Parameter(torch.cat((self._language_feature, new_language_feature), dim=0).requires_grad_(True))
+
+        # Re-initialize accumulating states
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def zero_frozen_gradients(self):
+        if hasattr(self, 'frozen_count') and self.frozen_count > 0:
+            if self._xyz.grad is not None:
+                self._xyz.grad[:self.frozen_count] = 0.0
+            if self._features_dc.grad is not None:
+                self._features_dc.grad[:self.frozen_count] = 0.0
+            if self._features_rest.grad is not None:
+                self._features_rest.grad[:self.frozen_count] = 0.0
+            if self._scaling.grad is not None:
+                self._scaling.grad[:self.frozen_count] = 0.0
+            if self._rotation.grad is not None:
+                self._rotation.grad[:self.frozen_count] = 0.0
+            if self._opacity.grad is not None:
+                self._opacity.grad[:self.frozen_count] = 0.0
 
     @property
     def get_scaling(self):
