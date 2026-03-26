@@ -152,17 +152,33 @@ class RealTimeGaussianInpainter:
             scale_radius = torch.median(local_scale).item() * self.cfg.boundary_radius_scale
         else:
             scale_radius = 0.0
-        bbox_diag = torch.norm(removed_xyz.max(dim=0).values - removed_xyz.min(dim=0).values).item()
+        
+        removed_min = removed_xyz.min(dim=0).values
+        removed_max = removed_xyz.max(dim=0).values
+        bbox_diag = torch.norm(removed_max - removed_min).item()
         boundary_radius = max(scale_radius, 0.01 * max(bbox_diag, 1e-4))
 
-        min_dist = self._nearest_distances_chunked(valid_xyz, removed_xyz)
-        boundary_local_mask = min_dist <= boundary_radius
-        boundary_idx = valid_idx[boundary_local_mask]
+        # MEMORY FIX (OOM PREVENTION): Pre-filter valid points using Axis-Aligned Bounding Box (AABB)
+        # before running pairwise distance checks between thousands of points
+        box_min = removed_min - boundary_radius
+        box_max = removed_max + boundary_radius
+        in_box_mask = (valid_xyz >= box_min).all(dim=-1) & (valid_xyz <= box_max).all(dim=-1)
+        in_box_indices = torch.where(in_box_mask)[0]
+        xyz_in_box = valid_xyz[in_box_mask]
 
-        # Robust fallback: use closest points if radius-based selection is sparse.
+        if xyz_in_box.numel() > 0:
+            min_dist = self._nearest_distances_chunked(xyz_in_box, removed_xyz)
+            boundary_local_mask = min_dist <= boundary_radius
+            boundary_idx = valid_idx[in_box_indices[boundary_local_mask]]
+        else:
+            boundary_idx = torch.empty(0, device=xyz.device, dtype=torch.long)
+
+        # Robust fallback: use closest points to the overall centroid if radius-based selection is sparse.
         if boundary_idx.numel() < self.cfg.min_boundary_points:
+            removed_center = removed_xyz.mean(dim=0, keepdim=True)
+            dist_to_center = torch.norm(valid_xyz - removed_center, dim=1)
             k = min(self.cfg.min_boundary_points, valid_idx.numel())
-            topk = torch.topk(min_dist, k=k, largest=False).indices
+            topk = torch.topk(dist_to_center, k=k, largest=False).indices
             boundary_idx = valid_idx[topk]
 
         return boundary_idx, boundary_radius
@@ -447,8 +463,11 @@ class RealTimeGaussianInpainter:
             translation = removed_center_proj - rotated_xyz.mean(dim=0, keepdim=True)
             placed_xyz = rotated_xyz + translation
 
-            # Final strict snap: project every cloned gaussian center exactly onto target plane.
-            placed_xyz = self._project_points_to_plane(placed_xyz, plane_n, plane_d)
+            # RELAXED PROJECTION: We intentionally do NOT flatten the cloned gaussians 
+            # onto the plane here. By skipping the strict point-to-plane snap, we map 
+            # the source patch baseline to the target plane, but preserve internal 3D 
+            # texture/height variations (e.g., grass blades, bumpy terrain) exactly 
+            # relative to that baseline.
 
             # Compose orientation quaternions so Gaussian covariance orientation follows new surface.
             q_align_batched = q_align.view(1, 4).expand(src_rotation.shape[0], 4)
