@@ -135,13 +135,14 @@ class RealTimeGaussianInpainter:
             out[i : i + chunk] = d.min(dim=1).values
         return out
 
-    def _extract_boundary_indices(self, removed_mask: torch.Tensor) -> Tuple[torch.Tensor, float]:
+    def _extract_boundary_indices(self, removed_mask: torch.Tensor) -> Tuple[torch.Tensor, float, torch.Tensor, torch.Tensor]:
         xyz = self.gaussians._xyz
         removed_idx = torch.where(removed_mask)[0]
         valid_idx = torch.where(~removed_mask)[0]
 
         if removed_idx.numel() == 0:
-            return torch.empty(0, device=xyz.device, dtype=torch.long), 0.0
+            empty_t = torch.empty(0, device=xyz.device, dtype=torch.long)
+            return empty_t, 0.0, empty_t, empty_t
 
         removed_xyz = xyz[removed_idx]
         valid_xyz = xyz[valid_idx]
@@ -181,7 +182,7 @@ class RealTimeGaussianInpainter:
             topk = torch.topk(dist_to_center, k=k, largest=False).indices
             boundary_idx = valid_idx[topk]
 
-        return boundary_idx, boundary_radius
+        return boundary_idx, boundary_radius, box_min, box_max
 
     def _fit_plane_ransac(self, points: torch.Tensor, inlier_dist: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -373,7 +374,7 @@ class RealTimeGaussianInpainter:
             # -----------------------------------------------------------------
             # Step 1: Void boundary extraction + RANSAC plane fit
             # -----------------------------------------------------------------
-            boundary_idx, boundary_radius = self._extract_boundary_indices(removed_mask)
+            boundary_idx, boundary_radius, box_min, box_max = self._extract_boundary_indices(removed_mask)
             if boundary_idx.numel() < 3:
                 return {"status": 0, "reason": 2, "cloned": 0}
 
@@ -533,4 +534,6 @@ class RealTimeGaussianInpainter:
                 "boundary": int(boundary_idx.numel()),
                 "cloned": int(new_n - old_n),
                 "boundary_radius": int(boundary_radius * 1000),
+                "box_min": box_min,
+                "box_max": box_max
             }

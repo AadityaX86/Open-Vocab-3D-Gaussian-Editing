@@ -25,6 +25,70 @@ from peft import PeftModel
 #  1. PURE MATH HELPERS (No Viser Dependency)
 # =========================================================================================
 
+def draw_bounding_box_gaussians(gaussians, box_min, box_max, color=(1.0, 0.0, 0.0), density=100):
+    """ Creates visible 3D Gaussians along the edges of a bounding box """
+    device = gaussians._xyz.device
+    corners = [
+        [box_min[0], box_min[1], box_min[2]],
+        [box_max[0], box_min[1], box_min[2]],
+        [box_max[0], box_max[1], box_min[2]],
+        [box_min[0], box_max[1], box_min[2]],
+        [box_min[0], box_min[1], box_max[2]],
+        [box_max[0], box_min[1], box_max[2]],
+        [box_max[0], box_max[1], box_max[2]],
+        [box_min[0], box_max[1], box_max[2]]
+    ]
+    edges = [
+        (0,1), (1,2), (2,3), (3,0), # bottom face
+        (4,5), (5,6), (6,7), (7,4), # top face
+        (0,4), (1,5), (2,6), (3,7)  # vertical edges
+    ]
+    lines_xyz = []
+    for (i, j) in edges:
+        p0 = torch.tensor(corners[i], device=device)
+        p1 = torch.tensor(corners[j], device=device)
+        # sample density points
+        t = torch.linspace(0, 1, density, device=device).unsqueeze(1)
+        segment = p0 + t * (p1 - p0)
+        lines_xyz.append(segment)
+    
+    new_xyz = torch.cat(lines_xyz, dim=0)
+    n_points = new_xyz.shape[0]
+
+    C0 = 0.28209479177387814
+    color_tensor = torch.tensor(color, device=device).float()
+    features_dc = ((color_tensor - 0.5) / C0).unsqueeze(0).expand(n_points, 3).unsqueeze(1) # [N, 1, 3]
+    features_rest = torch.zeros((n_points, gaussians._features_rest.shape[1], 3), device=device)
+    
+    diag = torch.norm(box_max - box_min)
+    scale = math.log(max(diag.item() * 0.005, 1e-4)) # Thin visible lines
+    scaling = torch.full((n_points, 3), scale, device=device)
+
+    rotation = torch.zeros((n_points, 4), device=device)
+    rotation[:, 0] = 1.0 # Identity q=[1,0,0,0]
+
+    # inverse sigmoid of 0.99 for opacity
+    op = math.log(0.99 / (1.0 - 0.99))
+    opacity = torch.full((n_points, 1), op, device=device)
+
+    def append_tensor(base, new_t):
+        if base is None: return None
+        return torch.nn.Parameter(torch.cat([base.detach(), new_t], dim=0).requires_grad_(True))
+
+    gaussians._xyz = append_tensor(gaussians._xyz, new_xyz)
+    gaussians._features_dc = append_tensor(gaussians._features_dc, features_dc)
+    gaussians._features_rest = append_tensor(gaussians._features_rest, features_rest)
+    gaussians._scaling = append_tensor(gaussians._scaling, scaling)
+    gaussians._rotation = append_tensor(gaussians._rotation, rotation)
+    gaussians._opacity = append_tensor(gaussians._opacity, opacity)
+    if hasattr(gaussians, '_language_feature') and gaussians._language_feature is not None:
+        lang_feat = torch.zeros(
+            (n_points, gaussians._language_feature.shape[1]), 
+            device=device, 
+            dtype=gaussians._language_feature.dtype
+        )
+        gaussians._language_feature = append_tensor(gaussians._language_feature, lang_feat)
+
 def get_rotation_matrix(r, p, y):
     """ Creates a 3x3 rotation matrix from Roll, Pitch, Yaw (radians) using PyTorch """
     # Rotation about X (Roll)
@@ -259,6 +323,16 @@ def main(args, dataset_args, pipeline_args):
             rotate_selection(gaussians, mask, rpy)
 
         elif action in ["delete", "remove", "drop"]:
+            # Capture the exact bounding box of the removed item before any modifications.
+            if args.draw_search_box and mask.sum() > 0:
+                removed_xyz_for_box = gaussians._xyz[mask]
+                custom_box_min = removed_xyz_for_box.min(dim=0).values.clone()
+                custom_box_max = removed_xyz_for_box.max(dim=0).values.clone()
+                diag_for_box = torch.norm(custom_box_max - custom_box_min).item()
+                pad_for_box = max(0.01 * diag_for_box, 0.05) 
+                custom_box_min -= pad_for_box
+                custom_box_max += pad_for_box
+
             delete_selection(gaussians, mask)
             # Real-time 3D semantic patch inpainting executes immediately after deletion.
             stats = inpainter.inpaint(mask)
@@ -269,6 +343,14 @@ def main(args, dataset_args, pipeline_args):
                 )
             else:
                 print(f"   -> Inpainting skipped/fallback (reason={stats.get('reason', -1)})")
+
+            if args.draw_search_box and mask.sum() > 0:
+                print("   -> Drawing search space bounding box in RED...")
+                # Best effort to use the exact scaled bounds from inpainter, or default to the padded target.
+                final_min = stats.get("box_min", custom_box_min)
+                final_max = stats.get("box_max", custom_box_max)
+                if final_min.numel() > 0:
+                    draw_bounding_box_gaussians(gaussians, final_min, final_max, color=(1.0, 0.0, 0.0))
     else:
         print("   -> Warning: No objects selected. Rendering unchanged scene.")
 
@@ -295,6 +377,7 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", type=float, default=0.2, help="CLIP Sensitivity")
     parser.add_argument("--inpaint_k", type=int, default=3, help="Semantic boundary clusters for inpainting")
     parser.add_argument("--inpaint_blend_k", type=int, default=5, help="KNN neighbors for seam blending")
+    parser.add_argument("--draw_search_box", action="store_true", help="Draws a red bounding box around the inpainting search area")
     
     # Standard Render Args
     parser.add_argument("--skip_train", action="store_true")
