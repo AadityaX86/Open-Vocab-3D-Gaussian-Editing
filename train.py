@@ -62,7 +62,7 @@ def compute_average(features):
 
 
 def majority_voting(gaussians, scene, pipe, background, dataset, args):
-    lf_path = r"D:\_Major Project\Code\Language Embedded Splats\data\garden\language_features"
+    lf_path = r"D:\_Major Project\Code\Language Embedded Splats\data\bike\language_features"
     print("Language feature path:", lf_path)
     if args.use_pq:
         voting_mat = -1 * torch.ones((gaussians._opacity.shape[0], 17), dtype=torch.uint8, device="cuda")
@@ -145,12 +145,32 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
         averaged_tensor /= (averaged_tensor.norm(dim=-1, keepdim=True) + 1e-9)
         invalid_gaussians = torch.sum(averaged_tensor,1) == 0
 
+        # --- MEMORY-SAFE FIX START ---
+        
+        # Free up heavy memory before C++ operations
+        del allocate_array
+        del features_array
+        gc.collect()
 
-        if args.faiss_add: index.add(averaged_tensor.cpu().numpy())
-        averaged_tensor = index.sa_encode(averaged_tensor.cpu().numpy())
-        averaged_tensor = torch.ByteTensor(averaged_tensor).to("cuda")
+        cpu_tensor = averaged_tensor.cpu().numpy()
+
+        if args.faiss_add: 
+            index.add(cpu_tensor)
+
+        # Process FAISS encoding in chunks to avoid std::bad_alloc
+        chunk_size = 50000  # Adjust if memory errors persist
+        encoded_list = []
+        
+        for i in range(0, cpu_tensor.shape[0], chunk_size):
+            chunk = cpu_tensor[i : i + chunk_size]
+            encoded_list.append(index.sa_encode(chunk))
+            
+        encoded_np = np.concatenate(encoded_list, axis=0)
+        
+        averaged_tensor = torch.ByteTensor(encoded_np).to("cuda")
         averaged_tensor[invalid_gaussians,:] = -1
         
+        # --- MEMORY-SAFE FIX END ---
 
     return averaged_tensor
 
@@ -209,6 +229,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
+
 def training_report(tb_writer, iteration, testing_iterations, scene : Scene, renderFunc, renderArgs):
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -241,6 +262,7 @@ def training_report(tb_writer, iteration, testing_iterations, scene : Scene, ren
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     # Set up command line argument parser

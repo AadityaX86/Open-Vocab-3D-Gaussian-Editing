@@ -17,7 +17,7 @@ from transformers import AutoTokenizer, AutoModelForTokenClassification, pipelin
 from peft import PeftModel
 
 # =========================================================================================
-#  MATH & GEOMETRY HELPERS (UNCHANGED)
+#  MATH & GEOMETRY HELPERS 
 # =========================================================================================
 
 def rotate_selection(gaussians, mask, roll_pitch_yaw):
@@ -91,27 +91,37 @@ def apply_overlay_heatmap(similarities, base_rgbs, threshold=0.2, colormap_name=
     return final_colors
 
 # =========================================================================================
-#  NEW: BERT COMMAND PARSER
+#  BERT COMMAND PARSER
 # =========================================================================================
-
 class CommandInterpreter:
     def __init__(self, model_path):
         print(f"[BERT] Loading LoRA model from {model_path}...")
+        
+        # EXACT LIST AND ORDER FROM YOUR NOTEBOOK (12 items)
         self.label_list = [
-            "O", "B-TARGET", "I-TARGET", "B-ACTION", "I-ACTION",
-            "B-DIRECTION", "I-DIRECTION", "B-ORIENTATION", "I-ORIENTATION",
-            "B-ATTRIBUTE", "I-ATTRIBUTE"
+            "O",
+            "B-ACTION",
+            "B-TARGET",
+            "B-ATTRIBUTE", "I-ATTRIBUTE",
+            "B-DIRECTION",
+            "B-ORIENTATION",
+            "B-MAGNITUDE", "I-MAGNITUDE",
+            "B-REFERENCE", "I-REFERENCE",
+            "B-AXIS"
         ]
+        
         self.label2id = {l: i for i, l in enumerate(self.label_list)}
         self.id2label = {i: l for l, i in self.label2id.items()}
         
         base_model_name = "bert-base-uncased"
         self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
         
-        # Load Base
+        # Load Base Model with 12 labels
         base_model = AutoModelForTokenClassification.from_pretrained(
-            base_model_name, num_labels=len(self.label_list),
-            id2label=self.id2label, label2id=self.label2id
+            base_model_name, 
+            num_labels=len(self.label_list),
+            id2label=self.id2label, 
+            label2id=self.label2id
         )
         
         # Load LoRA
@@ -119,8 +129,11 @@ class CommandInterpreter:
         self.model.eval()
         
         self.nlp = pipeline(
-            "token-classification", model=self.model, tokenizer=self.tokenizer,
-            aggregation_strategy="simple", device=0 if torch.cuda.is_available() else -1
+            "token-classification", 
+            model=self.model, 
+            tokenizer=self.tokenizer,
+            aggregation_strategy="simple", 
+            device=0 if torch.cuda.is_available() else -1
         )
 
     def parse(self, text):
@@ -128,21 +141,39 @@ class CommandInterpreter:
         parsed = {}
         target_parts = []
         
+        # Keywords to help if the model is uncertain (Added scale words)
+        action_keywords = ["move", "rotate", "scale", "delete", "paint", "color", "lift", "remove", "grow", "shrink", "resize", "bigger", "smaller"]
+
         for entity in results:
             label = entity['entity_group']
-            word = entity['word'].strip()
+            word = entity['word'].strip().lower()
             
+            # Map labels to logic
             if label == "TARGET":
                 target_parts.append(word)
             elif label == "ATTRIBUTE":
-                target_parts.insert(0, word) # Adjective before noun
+                target_parts.insert(0, word)
+            elif label == "ACTION":
+                parsed['ACTION'] = word
             else:
-                parsed[label] = word.lower()
+                # Capture DIRECTION, ORIENTATION, MAGNITUDE, AXIS, etc.
+                parsed[label] = word
         
-        if target_parts:
-            parsed['FULL_TARGET'] = " ".join(target_parts)
-        return parsed
+        # Safety Check: If ACTION wasn't caught, force it from keywords.
+        text_lower = text.lower().split()
+        if 'ACTION' not in parsed:
+            for word in text_lower:
+                if word in action_keywords:
+                    parsed['ACTION'] = word
+                    break
 
+        if target_parts:
+            # Clean target parts of any stray action words or tiny fragments
+            clean_target = [w for w in target_parts if w not in action_keywords and len(w) > 1]
+            parsed['FULL_TARGET'] = " ".join(clean_target)
+            
+        return parsed
+    
 # =========================================================================================
 #  MAIN APPLICATION
 # =========================================================================================
@@ -291,7 +322,7 @@ def main(args, dataset_args, pipeline_args):
             
             render_scene(highlight_mask=state["current_mask"], similarity_scores=similarity)
 
-    # --- NEW: AI COMMAND HANDLER ---
+    # --- FULLY UPGRADED AI COMMAND HANDLER ---
     def handle_ai_command(_):
         text = gui_chat.value
         if not text or not commander: 
@@ -323,40 +354,79 @@ def main(args, dataset_args, pipeline_args):
         action = parsed.get("ACTION", "").lower()
         direction = parsed.get("DIRECTION", "").lower()
         orientation = parsed.get("ORIENTATION", "").lower()
+        text_lower = text.lower() # Raw text fallback for edge cases
         
         mask = state["current_mask"]
         
+        # --- A. MOVE ---
         if action in ["move", "slide", "push", "lift"]:
             offset = [0.0, 0.0, 0.0]
             dist = 1.0 # Default distance
-            if "left" in direction: offset[0] = -dist
-            elif "right" in direction: offset[0] = dist
-            elif "up" in direction: offset[1] = dist
-            elif "down" in direction: offset[1] = -dist
-            elif "forward" in direction: offset[2] = dist
-            elif "back" in direction: offset[2] = -dist
+            # Check BERT direction tag or raw text as fallback
+            if "left" in direction or "left" in text_lower: offset[0] = -dist
+            elif "right" in direction or "right" in text_lower: offset[0] = dist
+            elif "up" in direction or "up" in text_lower: offset[1] = dist
+            elif "down" in direction or "down" in text_lower: offset[1] = -dist
+            elif "forward" in direction or "forward" in text_lower: offset[2] = dist
+            elif "back" in direction or "back" in text_lower: offset[2] = -dist
             
             move_selection(gaussians, mask, offset)
-            gui_logs.value = f"Moved '{target_desc}' {direction}."
+            gui_logs.value = f"Moved '{target_desc}'."
 
+        # --- B. ROTATE ---
         elif action in ["rotate", "turn", "spin"]:
-            rads = 1.57 # 90 degrees
+            rads = 1.57 # 90 degrees default
             rpy = [0.0, 0.0, 0.0]
             # Assume Y-axis (Up) rotation for now
-            if "counter" in orientation: rpy[1] = rads
-            else: rpy[1] = -rads # Clockwise
+            if "counter" in orientation or "counter" in text_lower: 
+                rpy[1] = rads
+            else: 
+                rpy[1] = -rads # Clockwise by default
             
             rotate_selection(gaussians, mask, rpy)
-            gui_logs.value = f"Rotated '{target_desc}' {orientation}."
+            gui_logs.value = f"Rotated '{target_desc}'."
             
+        # --- C. DELETE ---
         elif action in ["delete", "remove", "drop"]:
             delete_selection(gaussians, mask)
             gui_logs.value = f"Deleted '{target_desc}'."
             
+        # --- D. COLOR / PAINT ---
         elif action in ["paint", "color"]:
-            # Basic fallback for painting red if detected
-            color_selection(gaussians, mask, np.array([1.0, 0.0, 0.0]))
-            gui_logs.value = f"Painted '{target_desc}' (Default Red)."
+            # Check the sentence for specific colors and map to RGB
+            if "blue" in text_lower:
+                rgb, c_name = [0.0, 0.0, 1.0], "Blue"
+            elif "green" in text_lower:
+                rgb, c_name = [0.0, 1.0, 0.0], "Green"
+            elif "yellow" in text_lower:
+                rgb, c_name = [1.0, 1.0, 0.0], "Yellow"
+            elif "white" in text_lower:
+                rgb, c_name = [1.0, 1.0, 1.0], "White"
+            elif "black" in text_lower:
+                rgb, c_name = [0.0, 0.0, 0.0], "Black"
+            elif "purple" in text_lower:
+                rgb, c_name = [0.5, 0.0, 0.5], "Purple"
+            elif "orange" in text_lower:
+                rgb, c_name = [1.0, 0.5, 0.0], "Orange"
+            else:
+                # Default fallback
+                rgb, c_name = [1.0, 0.0, 0.0], "Red"
+                
+            color_selection(gaussians, mask, np.array(rgb))
+            gui_logs.value = f"Painted '{target_desc}' ({c_name})."
+
+        # --- E. SCALE ---
+        elif action in ["scale", "resize", "grow", "shrink", "bigger", "smaller"]:
+            scale_factor = 2.0 # Default to make it larger
+            # Check if user wants it smaller
+            if "shrink" in action or "smaller" in text_lower:
+                scale_factor = 0.5
+                
+            scale_selection(gaussians, mask, scale_factor)
+            gui_logs.value = f"Scaled '{target_desc}' (x{scale_factor})."
+            
+        else:
+            gui_logs.value = f"Unknown action: '{action}'. Try move, rotate, scale, paint, or delete."
 
         # Refresh Scene
         render_scene(highlight_mask=mask, similarity_scores=None)
