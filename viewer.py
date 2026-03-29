@@ -11,6 +11,8 @@ import matplotlib.cm as cm
 from argparse import ArgumentParser
 from gaussian_renderer import GaussianModel
 from arguments import ModelParams, PipelineParams, get_combined_args
+from utils.inpainting_utils import InpaintingConfig, RealTimeGaussianInpainter
+import math
 
 # --- NEW IMPORTS FOR BERT ---
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
@@ -22,12 +24,17 @@ from peft import PeftModel
 
 def rotate_selection(gaussians, mask, roll_pitch_yaw):
     """ Rotates the selection around its center of mass. """
+    if mask is None or not mask.any(): return
     with torch.no_grad():
         center = gaussians._xyz[mask].mean(dim=0)
         rot_obj = tf.SO3.from_rpy_radians(*roll_pitch_yaw)
         R = torch.tensor(rot_obj.as_matrix(), device=gaussians._xyz.device, dtype=torch.float32)
-        xyz_centered = gaussians._xyz[mask] - center
-        gaussians._xyz[mask] = (xyz_centered @ R.T) + center
+        
+        new_xyz = gaussians._xyz.clone()
+        xyz_centered = new_xyz[mask] - center
+        new_xyz[mask] = (xyz_centered @ R.T) + center
+        gaussians._xyz.copy_(new_xyz)
+
         q_new = torch.tensor(rot_obj.wxyz, device=gaussians._rotation.device, dtype=torch.float32)        
         
         def quat_mult(q1, q2):
@@ -40,35 +47,115 @@ def rotate_selection(gaussians, mask, roll_pitch_yaw):
                 w1*z2 + x1*y2 - y1*x2 + z1*w2
             ], dim=-1)
 
-        gaussians._rotation[mask] = quat_mult(q_new, gaussians._rotation[mask])
-        gaussians._rotation[mask] = torch.nn.functional.normalize(gaussians._rotation[mask], dim=-1)
+        new_rot = gaussians._rotation.clone()
+        new_rot[mask] = quat_mult(q_new, new_rot[mask])
+        new_rot[mask] = torch.nn.functional.normalize(new_rot[mask], dim=-1)
+        gaussians._rotation.copy_(new_rot)
 
 def scale_selection(gaussians, mask, scale_factor):
     """ Scales the selection relative to its center of mass. """
-    if scale_factor <= 0: return
+    if scale_factor <= 0 or mask is None or not mask.any(): return
     with torch.no_grad():
         center = gaussians._xyz[mask].mean(dim=0)
-        gaussians._xyz[mask] = (gaussians._xyz[mask] - center) * scale_factor + center
-        gaussians._scaling[mask] += np.log(scale_factor)
+        new_xyz = gaussians._xyz.clone()
+        new_xyz[mask] = (new_xyz[mask] - center) * scale_factor + center
+        gaussians._xyz.copy_(new_xyz)
+        
+        new_scale = gaussians._scaling.clone()
+        new_scale[mask] += np.log(scale_factor)
+        gaussians._scaling.copy_(new_scale)
 
 def delete_selection(gaussians, mask):
     """ 'Deletes' objects by setting opacity to -infinity. """
+    if mask is None or not mask.any(): return
     with torch.no_grad():
-        gaussians._opacity[mask] = -100.0
+        new_op = gaussians._opacity.clone()
+        new_op[mask] = -100.0
+        gaussians._opacity.copy_(new_op)
 
 def color_selection(gaussians, mask, target_rgb):
     """ Paints selected objects by overwriting the 0th Spherical Harmonic. """
+    if mask is None or not mask.any(): return
     SH_C0 = 0.28209479177387814
     target_sh = (target_rgb - 0.5) / SH_C0
     with torch.no_grad():
-        new_color = torch.tensor(target_sh, device=gaussians._features_dc.device).float()
-        gaussians._features_dc[mask, 0, :] = new_color
+        new_dc = gaussians._features_dc.clone()
+        new_color = torch.tensor(target_sh, device=new_dc.device).float()
+        new_dc[mask, 0, :] = new_color
+        gaussians._features_dc.copy_(new_dc)
 
 def move_selection(gaussians, mask, offset_vector):
     """ Translates selected objects in 3D space. """
+    if mask is None or not mask.any(): return
     with torch.no_grad():
         offset = torch.tensor(offset_vector, device=gaussians._xyz.device).float()
-        gaussians._xyz[mask] += offset
+        # Non-in-place modification to avoid leaf node issues
+        new_xyz = gaussians._xyz.clone()
+        new_xyz[mask] += offset
+        gaussians._xyz.copy_(new_xyz)
+
+def draw_bounding_box_gaussians(gaussians, box_min, box_max, color=(1.0, 0.0, 0.0), density=100):
+    """ Creates visible 3D Gaussians along the edges of a bounding box """
+    device = gaussians._xyz.device
+    corners = [
+        [box_min[0], box_min[1], box_min[2]],
+        [box_max[0], box_min[1], box_min[2]],
+        [box_max[0], box_max[1], box_min[2]],
+        [box_min[0], box_max[1], box_min[2]],
+        [box_min[0], box_min[1], box_max[2]],
+        [box_max[0], box_min[1], box_max[2]],
+        [box_max[0], box_max[1], box_max[2]],
+        [box_min[0], box_max[1], box_max[2]]
+    ]
+    edges = [
+        (0,1), (1,2), (2,3), (3,0), # bottom face
+        (4,5), (5,6), (6,7), (7,4), # top face
+        (0,4), (1,5), (2,6), (3,7)  # vertical edges
+    ]
+    lines_xyz = []
+    for (i, j) in edges:
+        p0 = torch.tensor(corners[i], device=device)
+        p1 = torch.tensor(corners[j], device=device)
+        t = torch.linspace(0, 1, density, device=device).unsqueeze(1)
+        segment = p0 + t * (p1 - p0)
+        lines_xyz.append(segment)
+    
+    new_xyz = torch.cat(lines_xyz, dim=0)
+    n_points = new_xyz.shape[0]
+
+    C0 = 0.28209479177387814
+    color_tensor = torch.tensor(color, device=device).float()
+    features_dc = ((color_tensor - 0.5) / C0).unsqueeze(0).expand(n_points, 3).unsqueeze(1)
+    features_rest = torch.zeros((n_points, gaussians._features_rest.shape[1], 3), device=device)
+    
+    diag = torch.norm(box_max - box_min)
+    scale = math.log(max(diag.item() * 0.005, 1e-4)) # Thin visible lines
+    scaling = torch.full((n_points, 3), scale, device=device)
+
+    rotation = torch.zeros((n_points, 4), device=device)
+    rotation[:, 0] = 1.0 # Identity q=[1,0,0,0]
+
+    op = math.log(0.99 / (1.0 - 0.99))
+    opacity = torch.full((n_points, 1), op, device=device)
+
+    def append_tensor(base, new_t):
+        if base is None: return None
+        return torch.nn.Parameter(torch.cat([base.detach(), new_t], dim=0).requires_grad_(True))
+
+    with torch.no_grad():
+        gaussians._xyz = append_tensor(gaussians._xyz, new_xyz)
+        gaussians._features_dc = append_tensor(gaussians._features_dc, features_dc)
+        gaussians._features_rest = append_tensor(gaussians._features_rest, features_rest)
+        gaussians._scaling = append_tensor(gaussians._scaling, scaling)
+        gaussians._rotation = append_tensor(gaussians._rotation, rotation)
+        gaussians._opacity = append_tensor(gaussians._opacity, opacity)
+        if hasattr(gaussians, '_language_feature') and gaussians._language_feature is not None:
+            lang_feat = torch.zeros(
+                (n_points, gaussians._language_feature.shape[1]), 
+                device=device, 
+                dtype=gaussians._language_feature.dtype
+            )
+            gaussians._language_feature = append_tensor(gaussians._language_feature, lang_feat)
 
 def get_colormap_safe(name):
     try:
@@ -180,26 +267,38 @@ def main(args, dataset_args, pipeline_args):
     orig_rotation = gaussians._rotation.clone()
     orig_scaling = gaussians._scaling.clone()
     
+    def decode_all_features():
+        language_features_idx = gaussians._language_feature.clone()
+        check_valid = torch.sum(language_features_idx, 1)
+        invalid_index = check_valid == 255 * (index.coarse_code_size() + index.code_size)
+        decoded_features_cpu = np.zeros((language_features_idx.shape[0], 512), dtype=np.float32)
+        valid_mask_cpu = (invalid_index.cpu() == False).numpy()
+        decoded_features_cpu[valid_mask_cpu] = index.sa_decode(language_features_idx[valid_mask_cpu].cpu().numpy())
+        g_feat = torch.tensor(decoded_features_cpu, device=device, dtype=torch.float16)
+        del decoded_features_cpu
+        torch.cuda.empty_cache()
+        norm = g_feat.norm(dim=-1, keepdim=True)
+        g_feat.div_(norm + 1e-5)
+        return g_feat
+
     # --- 2. DECODE LANGUAGE FEATURES ---
     print("[4/6] Loading FAISS Index and Decoding Features...")
     index = faiss.read_index(args.pq_index)
-    language_features_idx = gaussians._language_feature.clone()
-    check_valid = torch.sum(language_features_idx, 1)
-    invalid_index = check_valid == 255 * (index.coarse_code_size() + index.code_size)
-    decoded_features_cpu = np.zeros((language_features_idx.shape[0], 512), dtype=np.float32)
-    valid_mask_cpu = (invalid_index.cpu() == False).numpy()
-    decoded_features_cpu[valid_mask_cpu] = index.sa_decode(language_features_idx[valid_mask_cpu].cpu().numpy())
-    gaussian_features = torch.tensor(decoded_features_cpu, device=device, dtype=torch.float16)
-    del decoded_features_cpu
-    torch.cuda.empty_cache()
-    norm = gaussian_features.norm(dim=-1, keepdim=True)
-    gaussian_features.div_(norm + 1e-5)
+    state = { "current_mask": None, "last_query": "", "gaussian_features": decode_all_features() }
+    
+    # Initialize real-time inpainter
+    inpainter = RealTimeGaussianInpainter(
+        gaussians=gaussians,
+        pq_index=index,
+        config=InpaintingConfig(
+            max_semantic_clusters=3,
+            blend_knn_k=5,
+        ),
+    )
 
     # --- 3. START VISER SERVER ---
     print("[5/6] Starting Viser Server...")
     server = viser.ViserServer(port=args.port)
-    
-    state = { "current_mask": None, "last_query": "" }
 
     # --- GUI LAYOUT ---
     with server.gui.add_folder("Semantic Editor"):
@@ -216,6 +315,7 @@ def main(args, dataset_args, pipeline_args):
         
         gui_query = server.gui.add_text("Target Object", initial_value="bicycle")
         gui_threshold = server.gui.add_slider("Selection Threshold", min=0.0, max=1.0, step=0.01, initial_value=0.22)
+        gui_draw_bbox = server.gui.add_checkbox("Draw Search BBox", initial_value=args.draw_search_box)
         btn_reset_all = server.gui.add_button("Reset All Edits", color="red")
         
         gui_color_picker = server.gui.add_rgb("Paint Color", initial_value=(1.0, 0.0, 0.0))
@@ -279,10 +379,10 @@ def main(args, dataset_args, pipeline_args):
         with torch.no_grad():
             text_tokens = tokenizer([query_text]).to(device)
             text_features = clip_model.encode_text(text_tokens)
-            text_features = text_features.to(gaussian_features.dtype)
+            text_features = text_features.to(state["gaussian_features"].dtype)
             text_features /= text_features.norm(dim=-1, keepdim=True)
             
-            similarity = (gaussian_features @ text_features.T).squeeze()
+            similarity = (state["gaussian_features"] @ text_features.T).squeeze()
             similarity = torch.nan_to_num(similarity, nan=0.0)
             
             state["current_mask"] = (similarity > threshold)
@@ -351,7 +451,22 @@ def main(args, dataset_args, pipeline_args):
             
         elif action in ["delete", "remove", "drop"]:
             delete_selection(gaussians, mask)
-            gui_logs.value = f"Deleted '{target_desc}'."
+            
+            # --- START INPAINTING MODIFICATION ---
+            stats = inpainter.inpaint(mask)
+            if stats.get("status", 0) == 1:
+                gui_logs.value = f"Deleted '{target_desc}' & Inpainted ({stats['cloned']} cloned)."
+                if gui_draw_bbox.value and "box_min" in stats:
+                    draw_bounding_box_gaussians(gaussians, stats["box_min"], stats["box_max"], color=(1.0, 0.0, 0.0))
+            else:
+                gui_logs.value = f"Deleted '{target_desc}'. (Inpaint skipped, reason={stats.get('reason', -1)})"
+            
+            # After appending elements, we must re-decode features
+            state["gaussian_features"] = decode_all_features()
+            # The mask needs to be resized to the new Gaussian count, we just reset the selection.
+            state["current_mask"] = None
+            gui_query.value = ""
+            # --- END INPAINTING MODIFICATION ---
             
         elif action in ["paint", "color"]:
             # Basic fallback for painting red if detected
@@ -377,6 +492,17 @@ def main(args, dataset_args, pipeline_args):
     def handle_delete(_):
         if state["current_mask"] is None: return
         delete_selection(gaussians, state["current_mask"])
+        stats = inpainter.inpaint(state["current_mask"])
+        if stats.get("status", 0) == 1:
+            gui_logs.value = f"Manual Delete & Inpaint ({stats['cloned']} cloned)."
+            if gui_draw_bbox.value and "box_min" in stats:
+                draw_bounding_box_gaussians(gaussians, stats["box_min"], stats["box_max"], color=(1.0, 0.0, 0.0))
+        else:
+            gui_logs.value = f"Manual Delete. (Inpaint skipped, reason={stats.get('reason', -1)})"
+        
+        state["gaussian_features"] = decode_all_features()
+        state["current_mask"] = None
+        gui_query.value = ""
         update_selection(None)
 
     def handle_paint(_):
@@ -429,6 +555,7 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", type=float, default=0.22) 
     parser.add_argument("--pq_index", type=str, required=True)
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--draw_search_box", action="store_true", help="Draws a red bounding box around the inpainting search area")
     args = get_combined_args(parser)
     
     if not os.path.exists(args.model_path):
